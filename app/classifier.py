@@ -1,3 +1,5 @@
+import openai
+
 CATEGORY_KEYWORDS = {
     "NDA": ["non-disclosure", "non disclosure", "confidentiality agreement", "nda"],
     "MSA": ["master services", "master agreement", "msa"],
@@ -17,8 +19,6 @@ def classify_by_keywords(text: str) -> str:
 
 def classify_with_ai(text: str) -> str:
     """AI-based classification for ambiguous documents. Calls external model."""
-    import openai
-
     response = openai.chat.completions.create(
         model="gpt-4",
         messages=[

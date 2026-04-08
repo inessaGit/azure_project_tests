@@ -1,6 +1,10 @@
 """
 conftest.py — shared fixtures available to ALL test layers.
 
+Important: OPENAI_API_KEY must be set before any openai import to allow
+the SDK's lazy client proxy to initialize. Tests mock the actual call,
+so this key is never used — but the SDK requires it to exist.
+
 How pytest finds this file:
   pytest walks up from the test file until it finds conftest.py.
   Any fixture defined here is auto-available without import.
@@ -10,6 +14,9 @@ Scope guide:
   "module"             — one fixture per test file. Faster, less isolated.
   "session"            — one fixture for the entire test run.
 """
+import os
+os.environ.setdefault("OPENAI_API_KEY", "test-key-mock-only")
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
