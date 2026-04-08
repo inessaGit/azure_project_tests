@@ -2,7 +2,7 @@
 LAYER 4 — REGRESSION TESTS
 ===========================
 What:  Lock in correct behavior permanently. One test per bug fix. Golden dataset.
-Mock:  External AI only (same as other layers).
+Mock:  External AI only.
 Speed: Fast — runs on every commit in CI.
 Tells you: Something that used to work is now broken.
 
@@ -12,17 +12,18 @@ Rule: Every bug fix MUST add a regression test.
 import time
 import pytest
 from unittest.mock import patch
-from app.classifier import classify_by_keywords
+from app.classifier import classify_by_keywords, classify_document
 
 
 # ---------------------------------------------------------------------------
 # Golden dataset — hand-reviewed, authoritative expected outputs
 # ---------------------------------------------------------------------------
-# Format: (document_text, expected_category)
-# These must NEVER regress. Add new entries as the system grows.
+# Tests keyword-matching entries through classify_by_keywords (fast, no AI).
+# The "Other" case is tested separately via classify_document to verify the
+# AI fallback path is actually invoked (not just that keywords return Other).
 
-GOLDEN_DATASET = [
-    # --- Core happy paths ---
+KEYWORD_DATASET = [
+    # Core happy paths
     (
         "This non-disclosure agreement entered into as of January 1, 2024 between Acme Corp and Beta Ltd.",
         "NDA",
@@ -39,35 +40,19 @@ GOLDEN_DATASET = [
         "Employment agreement for a full-time senior software engineer, including compensation and benefits.",
         "Employment",
     ),
-    (
-        "The party of the first part hereby agrees to the terms set forth.",
-        "Other",
-    ),
-    # --- Edge cases that were previously bugs (now fixed) ---
-    (
-        "NON-DISCLOSURE AGREEMENT",                         # all caps
-        "NDA",
-    ),
-    (
-        "Non-Disclosure Agreement\n\nThis agreement is made on the date written above.",
-        "NDA",
-    ),
-    (
-        "non disclosure agreement between the undersigned parties.",  # no hyphen
-        "NDA",
-    ),
-    (
-        "MASTER AGREEMENT for all services rendered hereunder.",      # all caps
-        "MSA",
-    ),
-    (
-        "CONFIDENTIALITY AGREEMENT protecting trade secrets.",        # synonym
-        "NDA",
-    ),
+    # Edge cases that were previously bugs (now fixed)
+    ("NON-DISCLOSURE AGREEMENT",                                                    "NDA"),
+    ("Non-Disclosure Agreement\n\nThis agreement is made on the date written above.", "NDA"),
+    ("non disclosure agreement between the undersigned parties.",                    "NDA"),
+    ("MASTER AGREEMENT for all services rendered hereunder.",                        "MSA"),
+    ("CONFIDENTIALITY AGREEMENT protecting trade secrets.",                          "NDA"),
+    # Word-boundary fix: these must NOT match as NDA
+    ("Please review the agenda before the meeting.",                                 "Other"),
+    ("The Hernandez matter is scheduled for Tuesday.",                               "Other"),
 ]
 
 
-@pytest.mark.parametrize("document_text,expected_category", GOLDEN_DATASET)
+@pytest.mark.parametrize("document_text,expected_category", KEYWORD_DATASET)
 @pytest.mark.regression
 def test_golden_dataset(document_text, expected_category):
     """
@@ -77,11 +62,25 @@ def test_golden_dataset(document_text, expected_category):
     result = classify_by_keywords(document_text)
     assert result == expected_category, (
         f"\nREGRESSION DETECTED\n"
-        f"  Input:    '{document_text[:80]}...'\n"
+        f"  Input:    '{document_text[:80]}'\n"
         f"  Got:      '{result}'\n"
         f"  Expected: '{expected_category}'\n"
-        f"Check recent changes to classifier.py keyword lists."
+        f"Check recent changes to CATEGORY_KEYWORDS in classifier.py."
     )
+
+
+@pytest.mark.regression
+def test_golden_dataset_other_triggers_ai_fallback():
+    """
+    'Other' from keyword matching must reach classify_with_ai.
+    Tests the full pipeline, not just the keyword layer.
+    Previously this entry was tested against classify_by_keywords only,
+    which bypassed the orchestration logic entirely.
+    """
+    with patch("app.classifier.classify_with_ai", return_value="Other") as mock_ai:
+        result = classify_document("The party of the first part hereby agrees to the terms set forth.")
+        mock_ai.assert_called_once()
+    assert result == "Other"
 
 
 # ---------------------------------------------------------------------------
@@ -92,8 +91,7 @@ def test_golden_dataset(document_text, expected_category):
 def test_regression_bug_uppercase_nda_not_matched():
     """
     Bug: 'NON-DISCLOSURE' in uppercase was not matched.
-    Fix: Added .lower() normalization before keyword comparison.
-    Date fixed: 2024-01-15. Must stay fixed.
+    Fix: .lower() normalization before keyword comparison.
     """
     assert classify_by_keywords("NON-DISCLOSURE AGREEMENT") == "NDA"
 
@@ -101,9 +99,8 @@ def test_regression_bug_uppercase_nda_not_matched():
 @pytest.mark.regression
 def test_regression_bug_nda_without_hyphen_not_matched():
     """
-    Bug: 'non disclosure' (no hyphen) was not in the keyword list.
-    Fix: Added 'non disclosure' as an explicit keyword variant.
-    Must stay fixed.
+    Bug: 'non disclosure' (no hyphen) was missing from the keyword list.
+    Fix: Added 'non disclosure' as an explicit variant.
     """
     assert classify_by_keywords("non disclosure agreement between the parties") == "NDA"
 
@@ -111,11 +108,11 @@ def test_regression_bug_nda_without_hyphen_not_matched():
 @pytest.mark.regression
 def test_regression_bug_first_match_priority():
     """
-    Bug: When a document contained keywords from multiple categories,
-    the category returned was non-deterministic (dict iteration order).
-    Fix: Category order in CATEGORY_KEYWORDS dict is now deterministic.
+    Bug: Non-deterministic category when multiple keywords matched
+    (depended on dict iteration order, which was undefined in older Python).
+    Fix: CATEGORY_KEYWORDS order is now explicit and documented.
+    NDA keywords appear first → NDA must win.
     """
-    # NDA keywords appear first in the dict → NDA must win
     result = classify_by_keywords("non-disclosure agreement with master services terms")
     assert result == "NDA"
 
@@ -124,9 +121,65 @@ def test_regression_bug_first_match_priority():
 def test_regression_empty_string_returns_other_not_error():
     """
     Bug: Empty string input caused a KeyError in early versions.
-    Fix: any() on empty list returns False cleanly → falls through to Other.
+    Fix: any() on empty iterable returns False cleanly → falls through to Other.
     """
-    result = classify_by_keywords("")
+    assert classify_by_keywords("") == "Other"
+
+
+@pytest.mark.regression
+def test_regression_agenda_no_longer_matches_nda():
+    """
+    Bug: 'agenda' contains 'nda' as a substring — was classified as NDA.
+    Fix: Word-boundary matching (re.search with \\b) prevents false positives.
+    """
+    assert classify_by_keywords("Please review the agenda for today's meeting.") == "Other"
+
+
+@pytest.mark.regression
+def test_regression_hernandez_no_longer_matches_nda():
+    """
+    Bug: 'Hernandez' contains 'nda' as a substring — was classified as NDA.
+    Fix: Word-boundary matching.
+    """
+    assert classify_by_keywords("The Hernandez matter is scheduled for Tuesday.") == "Other"
+
+
+# ---------------------------------------------------------------------------
+# AI response validation regression tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.regression
+def test_regression_invalid_ai_response_normalized_to_other():
+    """
+    Bug: AI returning free text (e.g. 'This appears to be an NDA.') was stored
+    directly as the category value, corrupting the database.
+    Fix: Response validated against VALID_CATEGORIES; anything else → 'Other'.
+    """
+    from unittest.mock import MagicMock
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = "This appears to be an NDA document."
+
+    with patch("app.classifier.openai.chat.completions.create", return_value=mock_response):
+        from app.classifier import classify_with_ai
+        result = classify_with_ai("ambiguous text")
+    assert result == "Other"
+
+
+@pytest.mark.regression
+def test_regression_empty_ai_choices_no_index_error():
+    """
+    Bug: response.choices[0] raised IndexError when OpenAI returned an
+    empty choices list (filtered response, error response).
+    Fix: Guard added before indexing.
+    """
+    from unittest.mock import MagicMock
+    mock_response = MagicMock()
+    mock_response.choices = []
+
+    with patch("app.classifier.openai.chat.completions.create", return_value=mock_response):
+        from app.classifier import classify_with_ai
+        result = classify_with_ai("some text")
     assert result == "Other"
 
 
@@ -137,16 +190,18 @@ def test_regression_empty_string_returns_other_not_error():
 @pytest.mark.regression
 def test_classification_performance_within_threshold():
     """
-    Guard: keyword classification of 1000 documents must complete in < 1s.
-    Failure here means a change introduced O(n²) behavior or regex backtracking.
+    Guard: 1000 keyword classifications must complete in < 0.05s.
+    (Actual runtime is ~0.001s — the threshold allows 50x regression headroom
+    before failing, which is enough to catch real regressions without being
+    flaky on a loaded CI machine.)
     """
     sample = "This non-disclosure agreement is between Acme Corp and Beta Ltd."
     start = time.perf_counter()
     for _ in range(1000):
         classify_by_keywords(sample)
     elapsed = time.perf_counter() - start
-    assert elapsed < 1.0, (
-        f"PERFORMANCE REGRESSION: 1000 classifications took {elapsed:.2f}s (limit: 1.0s)"
+    assert elapsed < 0.05, (
+        f"PERFORMANCE REGRESSION: 1000 classifications took {elapsed:.3f}s (limit: 0.05s)"
     )
 
 
@@ -155,23 +210,49 @@ def test_classification_performance_within_threshold():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.regression
-def test_regression_api_returns_category_field(client):
+def test_regression_api_response_includes_required_fields(client):
     """
-    Guard: API response must always include 'category' field.
-    A refactor that renamed the field would break all consumers silently.
+    Guard: API response schema must always include these fields.
+    A rename/removal would break all consumers silently.
     """
     resp = client.post("/documents/", json={
         "content": "This non-disclosure agreement is binding.",
         "filename": "nda.pdf",
     })
     assert resp.status_code == 200
-    assert "category" in resp.json(), "Response missing 'category' field — likely a schema regression"
+    data = resp.json()
+    for field in ("id", "filename", "category", "content", "created_at"):
+        assert field in data, f"Response missing required field: '{field}'"
 
 
 @pytest.mark.regression
-def test_regression_404_detail_message_format(client):
+def test_regression_404_detail_message_stable(client):
     """
-    Guard: 404 detail message format must stay stable (consumers may parse it).
+    Guard: 404 detail message format must stay stable — consumers may parse it.
     """
     resp = client.get("/documents/999999")
     assert resp.json()["detail"] == "Document not found"
+
+
+@pytest.mark.regression
+def test_regression_oversized_input_rejected(client):
+    """
+    Guard: content > 500k chars must return 422, not reach the classifier.
+    """
+    resp = client.post("/documents/", json={
+        "content": "x" * 500_001,
+        "filename": "big.pdf",
+    })
+    assert resp.status_code == 422
+
+
+@pytest.mark.regression
+def test_regression_path_traversal_filename_rejected(client):
+    """
+    Guard: path-traversal filenames must be rejected at the model boundary.
+    """
+    resp = client.post("/documents/", json={
+        "content": "non-disclosure agreement",
+        "filename": "../../etc/passwd",
+    })
+    assert resp.status_code == 422
